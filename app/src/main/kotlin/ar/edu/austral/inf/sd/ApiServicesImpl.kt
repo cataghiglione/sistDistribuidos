@@ -11,17 +11,26 @@ import ar.edu.austral.inf.sd.server.model.Signatures
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
+import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
+import org.springframework.http.HttpEntity
+import org.springframework.http.HttpHeaders
+import org.springframework.http.MediaType
 import org.springframework.stereotype.Component
+import org.springframework.web.client.RestClientException
 import org.springframework.web.context.request.RequestContextHolder
 import org.springframework.web.context.request.ServletRequestAttributes
+import org.springframework.web.client.RestTemplate
+import org.springframework.web.client.postForEntity
 import java.security.MessageDigest
 import java.util.*
 import java.util.concurrent.CountDownLatch
 import kotlin.random.Random
 
 @Component
-class ApiServicesImpl: RegisterNodeApiService, RelayApiService, PlayApiService {
+class ApiServicesImpl @Autowired constructor(
+    private val restTemplate: RestTemplate
+): RegisterNodeApiService, RelayApiService, PlayApiService {
 
     @Value("\${server.name:nada}")
     private val myServerName: String = ""
@@ -60,7 +69,7 @@ class ApiServicesImpl: RegisterNodeApiService, RelayApiService, PlayApiService {
         val receivedLength = message.length
         if (nextNode != null) {
             // Soy un relé. busco el siguiente y lo mando
-            // @ToDo do some work here
+            sendRelayMessage(message, receivedContentType, nextNode!!, signatures)
         } else {
             // me llego algo, no lo tengo que pasar
             if (currentMessageWaiting.value == null) throw BadRequestException("no waiting message")
@@ -98,14 +107,41 @@ class ApiServicesImpl: RegisterNodeApiService, RelayApiService, PlayApiService {
     }
 
     internal fun registerToServer(registerHost: String, registerPort: Int) {
-        // @ToDo acá tienen que trabajar ustedes
-        val registerNodeResponse: RegisterResponse = RegisterResponse("", -1, "", "")
-        println("nextNode = ${registerNodeResponse}")
-        nextNode = with(registerNodeResponse) { RegisterResponse(nextHost, nextPort, uuid, hash) }
+        val registerUrl = "http://$registerHost:$registerPort/register-node?host=localhost&port=$myServerPort&name=$myServerName"
+        try {
+            val response = restTemplate.postForEntity<RegisterResponse>(registerUrl)
+            val registerNodeResponse: RegisterResponse = response.body!!
+            println("nextNode = $registerNodeResponse")
+            nextNode = with(registerNodeResponse) { RegisterResponse(nextHost, nextPort, uuid, hash) }
+        }
+        catch (e:RestClientException) {
+            println("Failed to register to server $registerHost:$registerPort :${e.message}")
+        }
     }
 
     private fun sendRelayMessage(body: String, contentType: String, relayNode: RegisterResponse, signatures: Signatures) {
-        // @ToDo acá tienen que trabajar ustedes
+        val signature = clientSign(body, contentType)
+        val updatedSignatures = Signatures(signatures.items + signature)
+
+        val relayUrl = "http://${relayNode.nextHost}:${relayNode.nextPort}/relay"
+        val messageHeader = HttpHeaders().apply { setContentType(MediaType.parseMediaType(contentType)) }
+        val signatureHeader = HttpHeaders().apply { setContentType(MediaType.APPLICATION_JSON) }
+
+        try {
+            val response = restTemplate.postForEntity(
+                relayUrl,
+                mapOf(
+                    HttpEntity(body, messageHeader) to body,
+                    HttpEntity(updatedSignatures, signatureHeader) to updatedSignatures
+                ),
+                String::class.java
+            )
+            println("Message relayed successfully to ${relayNode.nextHost}:${relayNode.nextPort}. Response: ${response.body}")
+        } catch (e: RestClientException) {
+            println("Failed to relay message to ${relayNode.nextHost}:${relayNode.nextPort}: ${e.message}")
+            throw e
+        }
+
     }
 
     private fun clientSign(message: String, contentType: String): Signature {
